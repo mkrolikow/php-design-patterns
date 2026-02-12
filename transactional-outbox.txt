@@ -1,0 +1,168 @@
+# SQL
+
+```
+
+CREATE TABLE outbox_messages (
+  id            CHAR(36) PRIMARY KEY,
+  event_type    VARCHAR(100) NOT NULL,
+  payload       JSON NOT NULL,
+  status        VARCHAR(20) NOT NULL DEFAULT 'pending',
+  attempts      INT NOT NULL DEFAULT 0,
+  available_at  TIMESTAMP NULL,
+  created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  sent_at       TIMESTAMP NULL
+);
+
+CREATE INDEX idx_outbox_status_created ON outbox_messages(status, created_at);
+
+```
+
+# Zapis w transakcji
+
+```
+<?php
+
+function uuid(): string {
+    // prosto; w realu użyj ramsey/uuid
+    return sprintf(
+        '%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
+        random_int(0, 0xffff), random_int(0, 0xffff),
+        random_int(0, 0xffff),
+        random_int(0, 0x0fff) | 0x4000,
+        random_int(0, 0x3fff) | 0x8000,
+        random_int(0, 0xffff), random_int(0, 0xffff), random_int(0, 0xffff)
+    );
+}
+
+function createOrder(PDO $pdo, array $orderData): void
+{
+    $pdo->beginTransaction();
+    try {
+        // 1) zapis danych domeny
+        $stmt = $pdo->prepare("INSERT INTO orders (user_id, total) VALUES (:user_id, :total)");
+        $stmt->execute([
+            ':user_id' => $orderData['user_id'],
+            ':total'   => $orderData['total'],
+        ]);
+        $orderId = (int)$pdo->lastInsertId();
+
+        // 2) zapis eventu do outbox
+        $outboxId = uuid();
+        $payload = json_encode([
+            'order_id' => $orderId,
+            'user_id'  => $orderData['user_id'],
+            'total'    => $orderData['total'],
+            'occurred_at' => (new DateTimeImmutable())->format(DATE_ATOM),
+        ], JSON_THROW_ON_ERROR);
+
+        $stmt2 = $pdo->prepare("
+            INSERT INTO outbox_messages (id, event_type, payload, status)
+            VALUES (:id, :event_type, :payload, 'pending')
+        ");
+        $stmt2->execute([
+            ':id' => $outboxId,
+            ':event_type' => 'OrderCreated',
+            ':payload' => $payload,
+        ]);
+
+        $pdo->commit();
+    } catch (Throwable $e) {
+        $pdo->rollBack();
+        throw $e;
+    }
+}
+```
+
+# Worker: bezpieczne pobieranie i wysyłka
+# Ważne: nie bierz tych samych rekordów w kilku workerach naraz.
+# Pobieranie z blokadą (PostgreSQL – najlepiej)
+
+```
+$pdo->beginTransaction();
+
+// SKIP LOCKED pozwala wielu workerom brać różne rekordy bez konfliktu
+$stmt = $pdo->prepare("
+  SELECT id, event_type, payload
+  FROM outbox_messages
+  WHERE status = 'pending'
+    AND (available_at IS NULL OR available_at <= NOW())
+  ORDER BY created_at
+  FOR UPDATE SKIP LOCKED
+  LIMIT 50
+");
+$stmt->execute();
+$messages = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// oznacz jako 'processing' opcjonalnie (lub zostaw locked w tej transakcji)
+// ... tutaj zwykle commitujesz po pobraniu i procesujesz poza transakcją,
+// ale wtedy potrzebujesz statusu 'processing'.
+// Alternatywnie: procesuj w tej samej transakcji (może trwać za długo).
+
+$pdo->commit();
+```
+
+# Publikacja i oznaczenie jako sent
+
+# Załóżmy, że publish($type,$payload) wysyła do brokera:
+
+```
+
+foreach ($messages as $m) {
+    try {
+        publish($m['event_type'], $m['payload']); // RabbitMQ/Kafka/HTTP itd.
+
+        $stmt = $pdo->prepare("UPDATE outbox_messages SET status='sent', sent_at=NOW() WHERE id=:id");
+        $stmt->execute([':id' => $m['id']]);
+    } catch (Throwable $e) {
+        // retry z backoff
+        $stmt = $pdo->prepare("
+          UPDATE outbox_messages
+          SET status='pending',
+              attempts = attempts + 1,
+              available_at = DATE_ADD(NOW(), INTERVAL LEAST(60, POW(2, attempts)) SECOND)
+          WHERE id=:id
+        ");
+        $stmt->execute([':id' => $m['id']]);
+    }
+}
+
+```
+
+W MySQL składnia backoff/DATE_ADD będzie ok, ale FOR UPDATE SKIP LOCKED zależy od wersji silnika (InnoDB) i wersji MySQL. W PostgreSQL działa świetnie.
+
+
+Najważniejsze „pułapki” i dobre praktyki
+1) Dostarczanie będzie at-least-once
+
+Odbiorcy muszą być idempotentni (mogą dostać event drugi raz).
+
+stosuj event_id w payloadzie i deduplikację po stronie konsumenta, albo
+
+dedup_key/message_id i „processed_messages” u konsumenta.
+
+2) Kolejność zdarzeń
+
+Jeśli potrzebujesz kolejności per agregat (np. zamówienie):
+
+dodaj aggregate_id + sequence i publikuj rosnąco.
+
+3) Monitoring
+
+Zbieraj metryki:
+
+ile pending, ile failed, ile prób (attempts)
+
+opóźnienie: NOW - created_at dla pending
+
+4) Cleanup
+
+Po czasie archiwizuj/usuwaj sent (np. po 7–30 dniach).
+
+Kiedy Outbox ma największy sens?
+
+mikroserwisy / integracje event-driven
+
+publikacja do brokera po transakcji DB
+
+webhooki / integracje zewnętrzne (zamiast „strzelać webhookiem” w request-cie)
+
